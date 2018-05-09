@@ -1,0 +1,328 @@
+---
+title: "Machine Learning Course Project"
+author: "John Sullivan"
+date: "May 7, 2018"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Summary
+
+Using the barbell weight lifting dataset that contains accelerometer data from the quantified self movement, the goal was to build a model that would accurately predict if the barbell lifts were done correctly or incorrectly in 5 different ways.   Information on this web side can be found here:  http://web.archive.org/web/20161224072740/http:/groupware.les.inf.puc-rio.br/har 
+
+I decided to get fancy for this final assignment, and decided to build an ensemble model using various machine learning algorithms as found in the CARAT package to predict the 'classe' variable using the various accelerometer data.    I specifically removed the test subjects from the build to improve model usablitity.
+
+### Step 1 - Load the Libraries
+
+```{r libraries}
+# Get our Parallel going on
+library(doParallel)
+registerDoParallel(cores=4)
+
+# Define libaries for fast 'n' easy data manipulation in Data Tables
+library(R.utils)
+library(data.table)
+library(dplyr)
+library(janitor)
+
+# Analytical Model Building
+library(AppliedPredictiveModeling)
+library(caret)
+library(ggplot2)
+library(MASS)
+library(randomForest)
+library(gbm)
+```
+### Step 2 - Download the data and clean it up
+
+``` {r download_and_clean}
+
+# Check for the pml data, if it doesn't exist, download and read it in
+if (!exists('pml_training_input')) {
+    
+    # Download and unzip the file if needed
+    if (!file.exists("./pml-testing.csv"))  {
+        download.file('https://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv'
+                      , dest="./pml-testing.csv", mode = "wb")
+    }
+    if (!file.exists("./pml-training.csv"))  {
+        download.file('https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv'
+                      , dest="./pml-training.csv", mode = "wb")
+    }
+    
+    # Read in the data table 
+    pml_training_input <- fread("./pml-training.csv")
+    pml_testing_input <- fread("./pml-testing.csv")
+} 
+
+# Clean-up the training set to remove the non-applicable new_window=="yes" as well
+#  as get rid of a lot of now empty/useless columns
+
+pml_training <- filter(pml_training_input, new_window=="no" ) %>% 
+                mutate_all(funs(na_if(., ""))) %>%
+                remove_empty("cols")
+
+pml_testing <- filter(pml_testing_input, new_window=="no" ) %>% 
+                mutate_all(funs(na_if(., ""))) %>%
+                remove_empty("cols")
+rm(list=c("pml_training_input","pml_testing_input"))
+
+# To make the training and testing datasets consistent, convert all the integers
+#  in the independent variables to numerics.
+pml_training[,8:59] <- lapply(pml_training[,8:59,drop=FALSE],as.numeric)
+pml_testing[,8:59] <- lapply(pml_testing[,8:59,drop=FALSE],as.numeric)
+
+# Drop the first seven columns.  Sure, the name might be helpful, but that's kind of
+# cheating.  Drop the timestamps, though.
+
+pml_training <- pml_training[,8:60]
+pml_training$classe <- as.factor(pml_training$classe)
+pml_testing <- pml_testing[,8:60]
+```
+
+### Step 3 - Split up the training data set
+
+I split the assignment training dataset itself into three populations - 56% to train the individual algorithms, 24% for training the ensemble, and the remaining 20% of the data for testing model performance.  Then, I checked how many data points was left in each of the sets.
+
+``` {r split_the_data}
+# Create training, testing, and validation data sets
+inBuild <- createDataPartition(y=pml_training$classe,p=0.8, list=FALSE)
+etest <- pml_training[-inBuild,]; 
+ebuild <- pml_training[inBuild,]
+inTrain <- createDataPartition(y=ebuild$classe,p=0.7, list=FALSE)
+etrain <- ebuild[-inTrain,]; 
+btrain <- ebuild[inTrain,]
+# Check data point counts;
+dim(btrain); dim(etrain); dim(etest)
+
+```
+
+### Step 4 - Train the individual algorithms
+
+I tried a number of different algorithms as available in CARET (more variety is better in an ensemble, correct?) and found some to be more effective than others.
+
+Final algorithms I selected included:
+- K-nearest Neighbors (this one seems like it might be directly applicable to the problem)
+- Random Forest (a go-to that works well on many problems and an emsemble model in it's own right)
+- Linear Discriminant (LDA flavor was better than SLDA or HDDA)
+- Extreme Learning Neural (better than other neural flavors I tried, but not really that good in this application)
+- GBM Stochastic Gradient Boosting
+- Support Vector Machine
+
+I also tried a Naive Bayes algorithm, but couldn't get it to work so threw it out.
+
+I used 5-fold cross validation as it seemed the minimum that would work well and more folds took ridiculous amounts of time to execute.  Likely much more tuning could have been done for the various computation methods, but I was interested to see how the various algorithms would perform against each other using mostly stock settings.    The cross validation helped to improve the quality of the individual algorithm results.
+
+``` {r train_individual, cache=TRUE}
+
+# Build some models on base train set - pick some favorites from internet
+set.seed(75007)
+
+# K-nearest Neighbors
+ptm <- proc.time()
+modKC <- train(classe ~.,method="knn",data=btrain,
+               trControl = trainControl(method="cv",number=5))
+ptmKC <- proc.time() - ptm
+
+# Random Forest
+ptm <- proc.time()
+modRF <- train(classe ~.,method="rf", data=btrain, 
+               trControl = trainControl(method="cv",number=5))
+ptmRF <- proc.time() - ptm
+
+# Linear Discriminate
+ptm <- proc.time()
+modLDA <- train(classe ~.,method="lda",data=btrain)
+ptmLDA <- proc.time() - ptm
+
+# ELM (Extreme Learning Machine) Neural
+ptm <- proc.time()
+modELM<- train(classe ~.,method="elm", data=btrain,
+               trControl=trainControl(method='cv',number=5),
+               tuneGrid =expand.grid(.nhid=53,.actfun=c("sin","radbas","purelin","tansig")))
+ptmELM <- proc.time() - ptm
+
+
+# GBM Stochastic Gradient Boosting
+ptm <- proc.time()
+modGBM <- train(classe ~.,method = "gbm", data=btrain,
+                trControl=trainControl(method='cv',number=5),
+                verbose=F)
+ptmGBM <- proc.time() - ptm
+
+
+# Support Vector Machine
+ptm <- proc.time()
+modSVM <- train(classe ~.,method="svmLinear",data=btrain, preProc = c("center","scale"),
+                trControl=trainControl(method="cv",number=5))
+ptmSVM <- proc.time() - ptm
+```
+
+### Step 5 - Build the Ensemble
+
+To do this, score the individual models on the ensemble training set, and then build the ensemble on their results using GBM.
+
+
+``` {r score_models_ensemble, cache=TRUE}
+# Score individual models on the etrain dataset and create the stack for the ensemble model.  
+# Use the probability for each class where that is the model output, and for those where only a single class is predicted (ELM & SVM), set probabilities
+
+predKC <- predict(modKC, newdata=etrain, type="prob")
+predRF <- predict(modRF, newdata=etrain, type="prob")
+predLDA <- predict(modLDA, newdata=etrain, type="prob")
+predELM_cls <- predict(modELM, newdata=etrain)
+predELM <- data.frame(A=as.numeric(predELM_cls=="A"),
+                      B=as.numeric(predELM_cls=="B"),
+                      C=as.numeric(predELM_cls=="C"),
+                      D=as.numeric(predELM_cls=="D"),
+                      E=as.numeric(predELM_cls=="E"))
+predGBM <- predict(modGBM, newdata = etrain, type="prob")
+predSVM_cls <- predict(modSVM, newdata = etrain)
+predSVM <- data.frame(A=as.numeric(predSVM_cls=="A"),
+                      B=as.numeric(predSVM_cls=="B"),
+                      C=as.numeric(predSVM_cls=="C"),
+                      D=as.numeric(predSVM_cls=="D"),
+                      E=as.numeric(predSVM_cls=="E"))
+predGBM <- predict(modGBM, newdata = etrain, type="prob")
+
+
+etrain_STK <- data.frame(KC=predKC, RF=predRF, LDA=predLDA, 
+                         ELM=predELM, GBM=predGBM, SVM=predSVM, 
+            classe = etrain$classe, stringsAsFactors = T)
+
+# Stack the uber ensemble with GBM
+
+ptm <- proc.time()
+modSTK <- train(classe ~., data = etrain_STK, method = "gbm",
+                trControl=trainControl(method="cv", number=5),
+                tuneLength=3)
+ptmDF<- proc.time() - ptm
+```
+
+### Step 6 - Get the accuracy of the models
+
+``` {r test_accuracy, cache=TRUE}
+
+# Predict on the etest dataset, not the etrain.
+
+predKC_tst <- predict(modKC, newdata=etest,type='prob')
+predRF_tst <- predict(modRF, newdata=etest,type='prob')
+predLDA_tst <- predict(modLDA, newdata=etest,type='prob')
+predELM_tst_cls <- predict(modELM, newdata=etest)
+predELM_tst <- data.frame(A=as.numeric(predELM_tst_cls=="A"),
+                      B=as.numeric(predELM_tst_cls=="B"),
+                      C=as.numeric(predELM_tst_cls=="C"),
+                      D=as.numeric(predELM_tst_cls=="D"),
+                      E=as.numeric(predELM_tst_cls=="E"))
+predGBM_tst <- predict(modGBM, newdata = etest,type='prob')
+predSVM_tst_cls <- predict(modSVM, newdata = etest)
+predSVM_tst <- data.frame(A=as.numeric(predSVM_tst_cls=="A"),
+                      B=as.numeric(predSVM_tst_cls=="B"),
+                      C=as.numeric(predSVM_tst_cls=="C"),
+                      D=as.numeric(predSVM_tst_cls=="D"),
+                      E=as.numeric(predSVM_tst_cls=="E"))
+etest_stk <- data.frame(KC=predKC_tst, 
+                        RF=predRF_tst, 
+                        LDA=predLDA_tst, 
+                        ELM=predELM_tst, 
+                        GBM=predGBM_tst, 
+                        SVM=predSVM_tst, 
+                     classe = etest$classe, stringsAsFactors = T)
+predSTK_tst <- predict(modSTK, newdata = etest_stk)
+
+cm_KC <- confusionMatrix(predict(modKC, newdata=etest), etest$classe)
+cm_RF <- confusionMatrix(predict(modRF, newdata=etest), etest$classe)
+cm_LDA <- confusionMatrix(predict(modLDA, newdata=etest), etest$classe)
+cm_ELM <- confusionMatrix(predict(modELM, newdata=etest), etest$classe)
+cm_GBM <- confusionMatrix(predict(modGBM, newdata=etest), etest$classe)
+cm_SVM <- confusionMatrix(predict(modSVM, newdata=etest), etest$classe)
+cm_STK <- confusionMatrix(predSTK_tst, etest$classe)
+
+# Build Results table with accuracy, kappa, and run time
+model_type <- c('knn','rf','lda','elm','gbm','svmLinear','stack-gbm')
+run_time <-c(ptmKC[3],ptmRF[3],ptmLDA[3],ptmELM[3],
+             ptmGBM[3],ptmSVM[3],(ptmDF[3]+ptmKC[3]+ptmRF[3]+ptmLDA[3]+ptmELM[3]+
+                                  ptmGBM[3]+ptmSVM[3]))
+m_accuracy <- c(cm_KC$overall[1],
+                cm_RF$overall[1],
+                cm_LDA$overall[1],
+                cm_ELM$overall[1],
+                cm_GBM$overall[1],
+                cm_SVM$overall[1],
+                cm_STK$overall[1]
+                )
+m_kappa <- c(cm_KC$overall[2],
+             cm_RF$overall[2],
+             cm_LDA$overall[2],
+             cm_ELM$overall[2],
+             cm_GBM$overall[2],
+             cm_SVM$overall[2],
+             cm_STK$overall[2]
+)
+m_comparisons <- data.frame(model_type,run_time,m_accuracy,m_kappa)
+
+m_comparisons
+cm_STK$table
+```
+
+### Step 7 - Look at variable importance
+
+``` {r importance}
+
+# Variable Importance
+# from RF
+varImp(modRF)
+# from GBM
+summary(modGBM)
+
+# from LDA
+varImp(modLDA)
+# from GBM used for Stacking
+summary(modSTK)
+```
+
+### Step 8 - Graphical Output
+
+``` {R graphical_output}
+# Let's see how we did graphically
+
+par(mfrow=c(1,2))
+# Variable importance from RF Model
+imps <- varImp(modRF)$importance
+imps$varname <- row.names(imps)
+imps <-  imps[order(-imps$Overall),]
+imps_top <- imps[1:10,]
+barplot(imps_top$Overall,names.arg=row.names(imps_top), ylab="Importance",
+        xlab="Variable",
+        main="Top 10 important Variables", xaxt="n")
+text(x=seq(1:10)*1.2-.5, y=10,
+     labels=row.names(imps_top), srt=90, adj=0, xpd=TRUE)
+
+imps <- varImp(modSTK)$importance
+imps$varname <- row.names(imps)
+imps <-  imps[order(-imps$Overall),]
+imps_top <- imps[1:10,]
+barplot(imps_top$Overall,names.arg=row.names(imps_top), ylab="Importance",
+        xlab="Variable",
+        main="Top 10 Model Contributors", xaxt="n")
+text(x=seq(1:10)*1.2-.5, y=10,
+     labels=row.names(imps_top), srt=90, adj=0, xpd=TRUE)
+
+# Plot Accuracy vs. Time to Run
+par(mfrow=c(1,1))
+plot(m_accuracy~run_time, 
+     xlab = 'Run Time (seconds)', 
+     ylab = 'Accuracy', main = 'Accuracy vs. Run Time', ylim=c(.65,1.00),
+     data = m_comparisons)
+with(m_comparisons, text(m_accuracy~run_time, 
+            labels = model_type, pos = c(1,1,3,1,1,1,2)))
+```
+
+## Conclusions 
+
+It appears that we can create a model that predicts with >99% certainty (less than 1% error) outside of the training sample .... at least for these test subjects.   I suspect we might have more error with different test subjects that have their own idosyncracies in how they perform the exercise. 
+
+From our various results we can see that the stacked GBM ensemble model was the best and had over 99% accuracy and kappa, but took the longest to run.  The Random forest algorithm was almost as good and took half as much time to run.   The accuracy/efficiency inflection seemed to be the GBM algorithm that achieved accuracy of 95% in a little over two minutes to run.
